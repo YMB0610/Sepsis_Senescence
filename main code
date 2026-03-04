@@ -1,0 +1,171 @@
+#0. Loading packages
+library(Seurat)
+library(dplyr)
+library(qs)
+library(scop)
+library(ggplot2)
+library(ggsci)
+library(CellChat)
+library(patchwork)
+options(stringsAsFactors = FALSE)
+library(RColorBrewer)
+options(future.globals.maxSize = 1024^3*200)
+
+#1. Loading files
+lung <- qread("lung/01_lung_data.qs")
+spleen <- qread("spleen/01_spleen_data.qs")
+liver <- qread("liver/01_liver_data.qs")
+heart <- qread("heart/01_heart_data.qs")
+kidney <- qread("kidney/01_kidney_data.qs")
+PBMC <- qread("PBMC/01_PBMC_data.qs")
+
+#2. merge and integrated
+scRNA <- merge(lung,c(spleen,liver,heart,kidney,PBMC))
+data <- SCTransform(scRNA,verbose = FALSE, return.only.var.genes = F)
+data <- RunPCA(data, verbose = FALSE,npcs = 50)
+set.seed(123) 
+data$indiv <- paste(data$organ,data$sample, sep="_")
+data <- RunHarmony( object = data,  group.by.vars = "indiv", dims.use = 1:50)
+data <- FindNeighbors(data, reduction = "harmony", dims = 1:50)
+data <- FindClusters(data, resolution = 0.1, cluster.name = "harmony_clusters")
+data <- RunUMAP(data, reduction = "harmony", dims = 1:50,  reduction.name = "umap.harmony")
+data <- RunTSNE(data, reduction = "harmony", dims = 1:50,  reduction.name = "tsne.harmony")
+
+#3. visualization
+CellDimPlot(data,group.by="celltype",reduction="umap_harmony",show_stat=FALSE,label.size = 10)
+CellDimPlot(data,group.by="type",reduction="umap_harmony",show_stat=FALSE,label.size = 10)+scale_color_manual(values=rev(pal_npg()(2)))
+FeatureStatPlot(data,stat.by="Senescence_core",group.by="celltype",split.by="type",add_trend=TRUE,add_box=TRUE,comparisons=TRUE)*scale_fill_manual(values=rev(pal_npg()(2)))
+
+#4. Type DEGs
+Idents(data)<-data$celltype
+find_DEG<-function(cell_name="NEUT"){
+  sub_cluster<-subset(data,idents = cell_name)
+  Idents(sub_cluster)<-sub_cluster$type
+  DEG_Mvsc <- FindMarkers(sub_cluster,
+                          ident.1 = c('Sepsis'),
+                          ident.2 = c('Control'),
+                          verbose = FALSE ,
+                          logfc.threshold = 0)
+  DEG_Mvsc <- DEG_Mvsc %>%
+    mutate(sig=case_when(avg_log2FC <= -0.25 & p_val_adj < 0.05 ~ 'down',
+                         avg_log2FC >=  0.25 & p_val_adj < 0.05 ~ 'up',
+                         p_val_adj > 0.05 ~ 'non',
+                         avg_log2FC > -0.25 | avg_log2FC < 0.25 ~ 'non')) %>%
+    mutate(gene=row.names(DEG_Mvsc)) %>%
+	mutate(celltype=cell_name)
+  return(DEG_Mvsc)
+}
+gene_list<-list()
+for (cell in levels(data)) {
+  print(cell)
+  data1<-find_DEG(cell_name=cell)
+  head(data1)
+  gene_list[[cell]]<-data1
+}
+save(gene_list,file = "01_Type_DEG.rdata")
+DEG <- do.call(rbind,gene_list)
+b <- subset(DEG,sig != "non")
+enrich.go <- enrichGO(gene = unique(b$gene),
+    OrgDb = 'org.Mm.eg.db',
+    keyType = 'SYMBOL', 
+    ont = 'BP', 
+    pAdjustMethod = 'fdr', 
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2, 
+    readable = TRUE)
+gene_ENTREZID <- as.character(na.omit(mapIds(x = org.Mm.eg.db,
+                                                  keys = unique(b$gene),
+                                                  keytype = "SYMBOL",
+                                                  column = "ENTREZID")))
+kegg <- enrichKEGG(
+    gene = gene_ENTREZID,
+    keyType = 'kegg', 
+    organism = 'mmu',
+    pAdjustMethod = 'fdr', 
+    pvalueCutoff = 0.05, 
+    qvalueCutoff = 0.2)
+
+#5. pySCENIC in python
+import os, sys
+os.getcwd()
+os.listdir(os.getcwd()) 
+import loompy as lp;
+import numpy as np;
+import scanpy as sc;
+x=sc.read_csv("pySCENIC_dat_input.csv");
+row_attrs = {"Gene": np.array(x.var_names),};
+col_attrs = {"CellID": np.array(x.obs_names)};
+lp.create("sample.loom",x.X.transpose(),row_attrs,col_attrs);
+pyscenic grn --num_workers 30 --output adj.sample.tsv --method grnboost2 sample.loom allTFs_mm.txt
+pyscenic ctx adj.sample.tsv mm9-tss-centered-10kb-7species.mc9nr.feather--annotations_fname motifs-v9-nr.mgi-m0.001-o0.0.tbl --expression_mtx_fname sample.loom --mode "dask_multiprocessing" --output reg.csv --num_workers 30 --mask_dropouts
+pyscenic aucell sample.loom reg.csv --output sample_SCENIC.loom --num_workers 30
+
+#6. Endo subtype
+data <- Endo
+markers <- FindAllMarkers(data,only.pos=TRUE,logfc.threshold=0.25)
+markers <- subset(markers, p_val_adj < 0.05)
+sce.markers <- markers
+library(clusterProfiler)
+library(org.Mm.eg.db)
+ids <- suppressWarnings(bitr(sce.markers$gene, 'SYMBOL', 'ENTREZID', 'org.Mm.eg.db'))
+sce.markers=merge(sce.markers,ids,by.x='gene',by.y='SYMBOL')
+sce.markers$group=sce.markers$cluster
+sce.markers=sce.markers[sce.markers$group!="none",]
+gcSample=split(sce.markers$ENTREZID, sce.markers$cluster)
+BP <- compareCluster(gcSample, fun="enrichGO",OrgDb="org.Mm.eg.db" ,  
+                     pvalueCutoff=0.05,readable=TRUE,
+                     ont="BP") 
+VlnPlot(data,features="Senescence_core1",group.by="subtype",pt.size=0,sort="increasing")+scale_fill_manual(values=color_list)+geom_boxplot(width=0.4,fill="white")+NoLegend()
+FeatureStatPlot(data,stat.by=c("Cdkn1a","Cebpb","Cxcl1","Ccl2","Tnfaip3","Nfkbia"),group.by="subtype",split.by="type",stack=TRUE,comparisons=TRUE,palcolor=rev(pal_npg()(2)))
+
+#7. Neut subtype
+data <- Neut
+for (cell in unique(data$subtype)) {
+  print(cell)
+  data1<-find_DEG(cell_name=cell)
+  head(data1)
+  gene_list[[cell]]<-data1
+}
+DEG <- do.call(rbind,gene_list)
+DEG <- subset(DEG, sig != "non")
+DEG$Group <- paste(DEG$celltype,DEG$sig,sep="_")
+GO <- compareCluster(
+  geneCluster = split(DEG$gene, DEG$sig),
+  fun = "enrichGO",
+  OrgDb = 'org.Mm.eg.db',
+  keyType = "SYMBOL",  
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05, 
+  ont = "bp"
+)
+aPEAR::enrichmentNetwork(GO)
+
+#8. CCI
+data<-qread("01_data.qs")
+for (i in levels(data$type)){
+sub_meta<-subset(meta,type==i)
+sub_data<-as.matrix(GetAssayData(data,slot="data",assay="SCT")[,as.character(row.names(sub_meta))])
+cellchat <- createCellChat(object = sub_data, meta = sub_meta, group.by = "subtype")
+CellChatDB <- CellChatDB.mouse
+CellChatDB.use <- CellChatDB 
+cellchat@DB <- CellChatDB.use
+cellchat <- subsetData(cellchat) 
+future::plan("multicore", workers = 40) 
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- projectData(cellchat, PPI.mouse)
+cellchat <- computeCommunProb(cellchat)
+cellchat <- filterCommunication(cellchat, min.cells = 1)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+groupSize <- as.numeric(table(cellchat@idents))
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+saveRDS(cellchat, paste(i,"cellchat.RDS",sep="_"))
+}
+object.list <- list(Control=Control,Sepsis=Sepsis)
+cellchat <- mergeCellChat(object.list, add.names = names(object.list))
+compareInteractions(cellchat, show.legend = F, group = c(1,2))+scale_fill_jama()
+netVisual_heatmap(cellchat,comparison=c(1,2),title.name="Sepsis vs Control")
+rankNet(cellchat, mode = "comparison", stacked = T,do.stat =TRUE,comparison = c(1,2),color.use=rev(pal_npg()(2)),title = "Different pathways of Sepsis vs Control")+coord_flip()
+netVisual_bubble(cellchat,remove.isolate = FALSE,comparison=c(1,2),angle.x=45,color.text=rev(pal_npg()(2)))
+
