@@ -9,6 +9,8 @@ library(CellChat)
 library(patchwork)
 options(stringsAsFactors = FALSE)
 library(RColorBrewer)
+library(ConsensusClusterPlus)
+library(glmnet)
 options(future.globals.maxSize = 1024^3*200)
 
 #1. Loading files
@@ -168,4 +170,52 @@ compareInteractions(cellchat, show.legend = F, group = c(1,2))+scale_fill_jama()
 netVisual_heatmap(cellchat,comparison=c(1,2),title.name="Sepsis vs Control")
 rankNet(cellchat, mode = "comparison", stacked = T,do.stat =TRUE,comparison = c(1,2),color.use=rev(pal_npg()(2)),title = "Different pathways of Sepsis vs Control")+coord_flip()
 netVisual_bubble(cellchat,remove.isolate = FALSE,comparison=c(1,2),angle.x=45,color.text=rev(pal_npg()(2)))
+
+#9. ConsensusClusterPlus
+dat <- res[genes,as.character(row.names(meta_SA))]
+title <- "./ConsensusCluster"
+results <- ConsensusClusterPlus(as.matrix(dat), 
+                                maxK = 6, 
+                                reps = 1000, 
+                                pItem = 0.8, 
+                                pFeature = 1,
+                                title = title, 
+                                clusterAlg = "km", 
+                                distance = "euclidean", 
+                                seed = 123456, 
+                                plot = "pdf")
+maxK = 6
+Kvec = 2:maxK
+x1 = 0.1; x2 = 0.9 
+PAC = rep(NA,length(Kvec))
+names(PAC) = paste("K=",Kvec,sep = "") 
+for(i in Kvec){
+  M = results[[i]]$consensusMatrix
+  Fn = ecdf(M[lower.tri(M)])
+  PAC[i-1] = Fn(x2) - Fn(x1)
+}
+optK = Kvec[which.min(PAC)]
+icl <- calcICL(results,plot="png",writeTable=TRUE)
+annCol <- data.frame(results = paste0("Cluster",
+                                      results[[2]][['consensusClass']]),
+                     row.names = colnames(dat))
+
+#10. LASSO
+set.seed(111)
+met <- subset(SA_dat,Time_to_event_28days>0)
+met <- met[,c("Time_to_event_28days","Mortality_event_28days")]
+x<-t(as.matrix(dat[DEG2,as.character(row.names(met))])) 
+y<-Surv(met$Time_to_event_28days,met$Mortality_event_28days) 
+set.seed(2)
+cvfit = cv.glmnet(x, y, alpha = 1,family="cox")
+fit = glmnet(x, y, alpha = 1,family = "cox")
+plot(fit,xvar="lambda",label = F)
+co = coef(fit,s = cvfit$lambda.min) 
+coef = data.frame(gene = rownames(co),
+                 coefficient = as.numeric(co[,1]))
+sig_gene_mult_cox <- coef[coef[,2]!=0,1]
+d <- cbind(met,t(expr[,as.character(row.names(met))]))
+DEG_met_expr.lasso_cox <- d %>% 
+  dplyr::select(Mortality_event_28days,Time_to_event_28days,sig_gene_mult_cox) 
+multiCox <- coxph(Surv(Time_to_event_28days, Mortality_event_28days) ~ ., data =  DEG_met_expr.lasso_cox)
 
